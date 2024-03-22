@@ -51,7 +51,7 @@ pub fn parse_vp9_frames_and_super_frames() {
             packet,
         } = ivf_frame;
 
-        let frames = parser.parse_packet(packet).unwrap();
+        let frames = parser.parse_packet(&packet).collect::<Result<Vec<_>, _>>().unwrap();
         for frame in frames.iter() {
             assert_ne!(frame.compressed_header_data().len(), 0);
             assert_ne!(frame.compressed_header_and_tile_data().len(), 0);
@@ -94,7 +94,7 @@ pub fn parse_vp9_10bit() {
             packet,
         } = ivf_frame;
 
-        let frames = parser.parse_packet(packet).unwrap();
+        let frames = parser.parse_packet(&packet).collect::<Result<Vec<_>, _>>().unwrap();
         for frame in frames.iter() {
             assert_ne!(frame.compressed_header_data().len(), 0);
             assert_ne!(frame.compressed_header_and_tile_data().len(), 0);
@@ -125,7 +125,7 @@ pub fn parse_vp9_12bit() {
             packet,
         } = ivf_frame;
 
-        let frames = parser.parse_packet(packet).unwrap();
+        let frames = parser.parse_packet(&packet).collect::<Result<Vec<_>, _>>().unwrap();
         for frame in frames.iter() {
             assert_ne!(frame.compressed_header_data().len(), 0);
             assert_ne!(frame.compressed_header_and_tile_data().len(), 0);

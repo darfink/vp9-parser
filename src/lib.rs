@@ -378,8 +378,8 @@ impl Metadata {
 
 /// A VP9 frame.
 #[derive(Clone, Debug)]
-pub struct Frame {
-    data: Vec<u8>,
+pub struct Frame<'a> {
+    data: &'a [u8],
     profile: Profile,
     show_existing_frame: bool,
     frame_to_show_map_idx: Option<u8>,
@@ -436,14 +436,14 @@ pub struct Frame {
     segment_feature_data: [[i16; 4]; 8],
 }
 
-impl Frame {
+impl<'a> Frame<'a> {
     /// Creates a frame from the parser state.
     pub(crate) fn new(
         parser: &Vp9Parser,
         uncompressed_header_size: usize,
         compressed_header_size: usize,
         tile_size: usize,
-        data: Vec<u8>,
+        data: &'a [u8],
     ) -> Self {
         Self {
             data,
@@ -841,7 +841,7 @@ impl Frame {
     /// Destroys the frame and returns the underlying data buffer.
     pub fn into_vec(self) -> Vec<u8> {
         let Frame { data, .. } = self;
-        data
+        data.to_vec()
     }
 }
 
@@ -977,84 +977,13 @@ impl Vp9Parser {
     /// Packets needs to be supplied in the order they are appearing in the bitstream. The caller
     /// needs to reset the parser if the bitstream is changed or a seek happened. Not resetting the
     /// parser in such cases results in garbage data or errors.
-    pub fn parse_packet(&mut self, mut packet: Vec<u8>) -> Result<Vec<Frame>> {
-        if packet.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Test for a super frame.
-        let last_byte_index = packet.len() - 1;
-        let last_byte = packet[last_byte_index];
-        if last_byte & 0b1110_0000 == 0b1100_0000 {
-            let bytes_per_framesize_minus_1 = (last_byte & 0b11000) >> 3;
-            let frames_in_superframe_minus_1 = last_byte & 0b111;
-            let bytes_size: usize = (bytes_per_framesize_minus_1 + 1).into();
-            let frame_count: usize = (frames_in_superframe_minus_1 + 1).into();
-            let index_size = 2 + frame_count * bytes_size;
-            let first_byte_index = packet.len() - index_size;
-            let first_byte = packet[first_byte_index];
-
-            // Found a super frame.
-            if first_byte == last_byte {
-                let mut frames = Vec::with_capacity(frame_count);
-
-                let index_start = first_byte_index + 1;
-                let entry_size = frame_count * bytes_size;
-
-                let mut entry_data = Vec::with_capacity(entry_size);
-                entry_data.extend_from_slice(&packet[index_start..index_start + entry_size]);
-
-                match frame_count {
-                    1 => {
-                        // Odd, but valid bitstream configuration.
-                        let frame_size = self.read_frame_size(&mut entry_data, bytes_size, 0)?;
-                        packet.truncate(frame_size);
-                        let frame = self.parse_frame(packet)?;
-
-                        frames.push(frame);
-                    }
-                    2 => {
-                        // Most common case. The first frame produces a frame that is not displayed but
-                        // stored as a reference frame. The second frame is mostly empty and references
-                        // the previously stored frame.
-                        let frame_size = self.read_frame_size(&mut entry_data, bytes_size, 0)?;
-                        let mut left_over = packet.split_off(frame_size);
-                        let first_frame = self.parse_frame(packet)?;
-
-                        let frame_size = self.read_frame_size(&mut entry_data, bytes_size, 1)?;
-                        left_over.truncate(frame_size);
-                        let second_frame = self.parse_frame(left_over)?;
-
-                        frames.push(first_frame);
-                        frames.push(second_frame);
-                    }
-                    _ => {
-                        // Odd, but also a valid bitstream configuration.
-                        for frame_index in 0..frame_count {
-                            let frame_size =
-                                self.read_frame_size(&mut entry_data, bytes_size, frame_index)?;
-
-                            let left_over = packet.split_off(frame_size);
-                            let frame = self.parse_frame(packet)?;
-                            frames.push(frame);
-
-                            packet = left_over;
-                        }
-                    }
-                }
-
-                return Ok(frames);
-            }
-        }
-
-        // Normal frame.
-        let frame = self.parse_frame(packet)?;
-        Ok(vec![frame])
+    pub fn parse_packet<'a, 'b>(&'b mut self, packet: &'a [u8]) -> Vp9ParserFrameIterator<'a, 'b> {
+        Vp9ParserFrameIterator::new(self, packet)
     }
 
     fn read_frame_size(
         &self,
-        entry_data: &mut [u8],
+        entry_data: &[u8],
         bytes_size: usize,
         index: usize,
     ) -> Result<usize> {
@@ -1077,7 +1006,7 @@ impl Vp9Parser {
         Ok(value)
     }
 
-    fn parse_frame(&mut self, data: Vec<u8>) -> Result<Frame> {
+    fn parse_frame<'a>(&mut self, data: &'a [u8]) -> Result<Frame<'a>> {
         let mut br = BitReader::new(&data);
 
         let frame_marker = br.read_u8(2)?;
@@ -1099,7 +1028,7 @@ impl Vp9Parser {
             self.refresh_frame_flags = 0;
             self.loop_filter_level = 0;
 
-            let frame = Frame::new(self, 0, 0, 0, vec![]);
+            let frame = Frame::new(self, 0, 0, 0, &[]);
             return Ok(frame);
         } else {
             self.frame_to_show_map_idx = None;
@@ -1455,7 +1384,7 @@ impl Vp9Parser {
         while self.tile_rows_log2 < max_log2_tile_cols {
             let increment_tile_cols_log2 = br.read_bool()?;
             if increment_tile_cols_log2 {
-                self.tile_cols_log2 += 1;
+                self.tile_cols_log2 = self.tile_cols_log2.saturating_add(1);
             } else {
                 break;
             }
@@ -1497,6 +1426,112 @@ impl Vp9Parser {
         }
 
         Ok(())
+    }
+}
+
+/// A VP9 frame iterator
+pub struct Vp9ParserFrameIterator<'a, 'b> {
+    parser: &'b mut Vp9Parser,
+    packet: &'a [u8],
+    super_frame: Option<Vp9SuperFrame<'a>>,
+    frame_index: usize,
+}
+
+struct Vp9SuperFrame<'a> {
+    entry_data: &'a [u8],
+    bytes_size: usize,
+    frame_count: usize,
+}
+
+impl<'a, 'b> Vp9ParserFrameIterator<'a, 'b> {
+    fn new(parser: &'b mut Vp9Parser, packet: &'a [u8]) -> Self {
+        if packet.is_empty() {
+            return Self { packet, parser, super_frame: None, frame_index: 0 };
+        }
+
+        // Test for a super frame.
+        let last_byte_index = packet.len() - 1;
+        let last_byte = packet[last_byte_index];
+
+        if last_byte & 0b1110_0000 == 0b1100_0000 {
+            let bytes_per_framesize_minus_1 = (last_byte & 0b11000) >> 3;
+            let frames_in_superframe_minus_1 = last_byte & 0b111;
+            let bytes_size: usize = (bytes_per_framesize_minus_1 + 1).into();
+            let frame_count: usize = (frames_in_superframe_minus_1 + 1).into();
+            let index_size = 2 + frame_count * bytes_size;
+            let first_byte_index = packet.len() - index_size;
+            let first_byte = packet[first_byte_index];
+
+            let is_super_frame = first_byte == last_byte;
+
+            if is_super_frame {
+                let index_start = first_byte_index + 1;
+                let entry_size = frame_count * bytes_size;
+
+                let entry_data = &packet[index_start..index_start + entry_size];
+                return Vp9ParserFrameIterator {
+                    parser,
+                    packet,
+                    frame_index: 0,
+                    super_frame: Some(Vp9SuperFrame {
+                        entry_data,
+                        frame_count,
+                        bytes_size,
+                    }),
+                };
+            }
+        }
+
+        // Normal frame.
+        return Vp9ParserFrameIterator {
+            parser,
+            packet,
+            frame_index: 0,
+            super_frame: None,
+        }
+    }
+}
+
+impl<'a, 'b> Iterator for Vp9ParserFrameIterator<'a, 'b> {
+    type Item = Result<Frame<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.packet.is_empty() {
+            return None;
+        }
+
+        match self.super_frame.as_ref() {
+            Some(super_frame) => {
+                if self.frame_index >= super_frame.frame_count {
+                    return None;
+                }
+
+                let frame_size = match self.parser.read_frame_size(super_frame.entry_data, super_frame.bytes_size, self.frame_index) {
+                    Err(error) => return Some(Err(error)),
+                    Ok(frame) => frame,
+                };
+
+                let frame = match self.parser.parse_frame(self.packet) {
+                    Ok(frame) => frame,
+                    error => return Some(error),
+                };
+                self.frame_index += 1;
+
+                let (_, left_over) = self.packet.split_at(frame_size);
+                self.packet = left_over;
+
+                Some(Ok(frame))
+            }
+            None => {
+                let frame = match self.parser.parse_frame(self.packet) {
+                    Ok(frame) => frame,
+                    error => return Some(error),
+                };
+
+                self.packet = &[];
+                Some(Ok(frame))
+            }
+        }
     }
 }
 
